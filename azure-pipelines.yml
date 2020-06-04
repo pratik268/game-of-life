@@ -1,0 +1,290 @@
+parameters:
+- name: ver_type
+  displayName: Version Env
+  type: string
+  default: "4616"
+  values:
+    - "4616"
+    - "4615"
+- name: deployment_name
+  displayName: Deployment Name (No spaces)
+  type: string
+- name: deployment_env
+  displayName: Deployment Environment
+  type: string
+  default: "QA"
+  values:
+    - "QA"
+    - "DEV"
+- name: host_ip_1
+  displayName: Destination Host IP 1
+  type: string
+#- name: myObject
+#  type: object
+#  default: []
+
+variables:
+  - name: pool_name
+    value: 'ADO'
+  - name: name_convention
+    value: ${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}
+  - name: pool_shared_folder
+    value: /data/ADO_Pool_shared/$(name_convention)
+  - name: ansible_inventory_file
+    value: $(pool_shared_folder)/$(name_convention).yml
+  - name: ansible_inventory_name
+    value: $(name_convention)
+  - name: binaries_dir
+    value: $(pool_shared_folder)/downloads/
+ # - group: GPPSP_SECRETS # library which contains the secrets from service connection: 'AZR-C21-DV-138-02 - AzureRM' and keyvault: p21d13802540001
+
+
+trigger: none
+
+stages:
+- stage: 'CHECK_PARAMS_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}'
+  jobs:
+    - job: Check_Parameters
+      pool: $(pool_name)
+      steps:
+        - checkout: none
+        - bash: |
+            # check for IP address validity
+            echo ${{ parameters.host_ip_1 }} | grep -E '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+            if [ $? -ne 0 ]; then
+              echo "Host IP 1: ${{ parameters.host_ip_1 }} is invalid!"
+              exit 1
+            fi
+            # check if deployment name has spaces
+            if [[ ${{ parameters.deployment_name }} =~ (\ ) ]] ;then
+              echo "Deployment Name contains spaces!"
+              exit 1
+            fi
+          #failOnStderr: true
+          displayName: Check Parameters
+    - job: Show_Parameters
+      dependsOn: Check_Parameters
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            echo "Agent Directory: $(Build.SourcesDirectory)"
+            echo "Inventory Name: $(ansible_inventory_file)"
+            echo "Deployment Name: ${{ parameters.deployment_name }}"
+            echo "Version Stack: ${{ parameters.ver_type }}"
+            echo "Deployment Env: ${{ parameters.deployment_env }}"
+            echo "Binaries Download: $(binaries_dir)"
+            echo "Host IP : ${{ parameters.host_ip_1 }}"
+          displayName: Show Parameters Values
+
+
+- stage: 'PREP_ENV_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}'
+  dependsOn: CHECK_PARAMS_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}
+  variables:
+    - group: GPPSP_SECRETS # library which contains the secrets from service connection: 'AZR-C21-DV-138-02 - AzureRM' and keyvault: p21d13802540001
+  jobs:
+    - job: Prepare_Inventory
+      pool: $(pool_name)
+      steps:
+        - checkout: none
+        - bash: |
+            # remove existing inventory file and download folder
+            if [ -d "$(pool_shared_folder)" ]; then
+              rm -rf $(pool_shared_folder)
+            fi
+            mkdir -p $(pool_shared_folder)
+            mkdir -p $(binaries_dir)
+            # prepare inventory file
+            echo "[$(ansible_inventory_name)]" > $(ansible_inventory_file)
+            echo "${{ parameters.host_ip_1 }}" >> $(ansible_inventory_file)
+            cat $(ansible_inventory_file)
+          displayName: Prepare Ansible inventory file
+    - job: Check_Requirements
+      dependsOn: Prepare_Inventory
+      pool: $(pool_name)
+      steps: # the marketplace ansible task does not have *root directory option for agents
+        - checkout: none
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" -e @vars_folder/stack_${{ parameters.ver_type }}.yml checkHealth.yml -v
+            #add check if epel repo and yum is working, TBA
+          displayName: Check Requirements
+    - job: Download_Binaries
+      dependsOn: Check_Requirements
+      pool: $(pool_name)
+      steps:
+        #- checkout: none
+        - bash: |
+            rm -rf $(binaries_dir)
+            mkdir $(binaries_dir)
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -e "download_dir=$(binaries_dir) storage_account=$(GppStorageAccountName) storage_key=$(GppStorageAccountKey)" -e @vars_folder/stack_${{ parameters.ver_type }}.yml azcopyPackages.yml -v
+          displayName: Download binaries from Azure Storage
+
+- stage: 'PREREQUISITES_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}'
+  dependsOn: PREP_ENV_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}
+  variables:
+    - group: GPPSP_SECRETS # library which contains the secrets from service connection: 'AZR-C21-DV-138-02 - AzureRM' and keyvault: p21d13802540001
+  jobs:
+    - job: Disks
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" infra-disksOps.yml -v
+          displayName: Disks/LVM operations for ${{ parameters.ver_type }}
+    - job: Yum_Packages
+      dependsOn: Disks
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" prerequisitesInstall.yml -v
+          displayName:  Yum/Pip Install Packages
+    - job: Copy_Binaries
+      dependsOn: Yum_Packages
+      pool: $(pool_name)
+      steps:
+        - checkout: none
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "download_dir=$(binaries_dir) ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" distributePackagesAll.yml -v
+          displayName: Remote Copy Binaries to inventory hosts
+    - job: Install_Oracle_Java
+      dependsOn: Copy_Binaries
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installOracleJava.yml -v
+          displayName: Install Oracle Java
+    - job: Create_Users
+      dependsOn: Install_Oracle_Java
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" infra-createUser.yml -v
+          displayName: Create OS Users
+
+- stage: 'INSTALL_MQ_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}'
+  dependsOn: PREREQUISITES_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}
+  variables:
+    - group: GPPSP_SECRETS # library which contains the secrets from service connection: 'AZR-C21-DV-138-02 - AzureRM' and keyvault: p21d13802540001
+  jobs:
+    - job: Install_MQ
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installMQ.yml -v
+          displayName: Install MQ
+    - job: Install_MQAdminTool
+      dependsOn: Install_MQ
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installMQAdminTool.yml -v
+          displayName: Install MQAdmintool
+
+- stage: 'INSTALL_MIDDLEWARE_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}'
+  dependsOn: INSTALL_MQ_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}
+  variables:
+    - group: GPPSP_SECRETS # library which contains the secrets from service connection: 'AZR-C21-DV-138-02 - AzureRM' and keyvault: p21d13802540001
+  jobs:
+    - job: GPP_Setup
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" -e @vars_folder/stack_${{ parameters.ver_type }}.yml infra-presetup.yml -v
+          displayName: Set Up GPP Env
+    - job: Install_WLS_WAS_JBOSS
+      dependsOn: GPP_Setup
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name) user_type=WLS" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installMiddleware.yml -v
+          displayName: Install Weblogic
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name) user_type=WAS" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installMiddleware.yml -v
+          displayName: Install Websphere
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name) user_type=JBOSS" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installMiddleware.yml -v
+          displayName: Install JBoss
+    - job: Install_TPAT_All
+      dependsOn: Install_WLS_WAS_JBOSS
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name) user_type=WLS" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installTPAT.yml -v
+          displayName: Install TPAT for Weblogic
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name) user_type=WAS" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installTPAT.yml -v
+          displayName: Install TPAT for Websphere
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name) user_type=JBOSS" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installTPAT.yml -v
+          displayName: Install TPAT for JBoss
+
+- stage: 'INSTALL_CLIENTS_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}'
+  dependsOn: INSTALL_MIDDLEWARE_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}
+  variables:
+    - group: GPPSP_SECRETS # library which contains the secrets from service connection: 'AZR-C21-DV-138-02 - AzureRM' and keyvault: p21d13802540001
+  jobs:
+    - job: Install_OracleClient
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installOracleClient.yml -v
+          displayName: Installs Oracle Client
+    - job: Install_MQClient
+      dependsOn: Install_OracleClient
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible-playbook -i $(ansible_inventory_file) -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword) env=$(ansible_inventory_name)" -e @vars_folder/stack_${{ parameters.ver_type }}.yml installMQClient.yml -v
+          displayName: Installs MQ Client
+
+- stage: 'CLEANUP_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}'
+  dependsOn: INSTALL_CLIENTS_${{ parameters.deployment_env }}_${{ parameters.deployment_name }}_${{ parameters.ver_type }}
+  variables:
+    - group: GPPSP_SECRETS # library which contains the secrets from service connection: 'AZR-C21-DV-138-02 - AzureRM' and keyvault: p21d13802540001
+  jobs:
+    - job: Cleanup_Files
+      pool: $(pool_name)
+      steps:
+        - bash: |
+            # delete remote package folder
+            cd $(Build.SourcesDirectory)/ansible/
+            # general common variables for all ansible playbooks are passed in from group_vars/all.yml
+            ansible $(ansible_inventory_name) -i $(ansible_inventory_file) -b -m file -a "path={{ remote_copy_dir }} state=absent" -e "ansible_ssh_pass=$(azadminUserPassword) ansible_become_pass=$(azadminUserPassword)" -e @group_vars/all.yml
+            # remove local agent package folder
+            echo "Remove pool shared folder: $(pool_shared_folder)"
+            rm -rf $(pool_shared_folder)
+          displayName: Clean up Files
